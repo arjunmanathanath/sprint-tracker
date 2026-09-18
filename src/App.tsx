@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./store/useStore";
+import { msUntilNextDue } from "./logic/backupSchedule";
 import { TabBar } from "./components/TabBar";
 import { Onboarding } from "./screens/Onboarding";
 import { Today } from "./screens/Today";
@@ -14,10 +15,37 @@ export default function App() {
   const tab = useStore((s) => s.tab);
   const startDate = useStore((s) => s.config.startDate);
   const dismissError = useStore((s) => s.dismissError);
+  const autoBackupEnabled = useStore((s) => s.config.autoBackup.enabled);
+  const autoBackupTime = useStore((s) => s.config.autoBackup.time);
+  const runNightlyBackup = useStore((s) => s.runNightlyBackup);
 
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Nightly backup: run when due (catch-up on open / foreground), and at the scheduled time
+  // while the app stays open. A browser app cannot run while closed, so "on next open" is the
+  // fallback for nights the app was not running.
+  useEffect(() => {
+    if (!ready || !startDate || !autoBackupEnabled) return;
+    let timer: number | undefined;
+    const arm = () => {
+      timer = window.setTimeout(async () => {
+        await runNightlyBackup();
+        arm();
+      }, msUntilNextDue(new Date(), autoBackupTime));
+    };
+    void runNightlyBackup();
+    arm();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void runNightlyBackup();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [ready, startDate, autoBackupEnabled, autoBackupTime, runNightlyBackup]);
 
   if (!ready) {
     return (

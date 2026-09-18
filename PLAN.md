@@ -108,7 +108,8 @@ Reviewed and browser-tested; 9 bugs fixed and a prioritised gap list written up 
 The four P1 items from that review are built: tick fills planned minutes, Partial state, Trim with a
 reason, and Load adjustment (see README "Logging" and "Pause, skip, trim & recalibrate"). The P2 batch
 followed: forgotten-stopwatch guard, sustained-warning tracking, persistent storage after onboarding,
-recent daily notes in scratch cards, 14-day strip, Today date kept across tabs.
+recent daily notes in scratch cards, 14-day strip, Today date kept across tabs. Then: nightly automatic
+backup (in-app snapshots at 23:58 with catch-up, restore/undo, optional folder file on desktop Chrome/Edge).
 
 v1 complete: 42 tests green, `npm run build` emits the PWA. Decisions made during the build:
 

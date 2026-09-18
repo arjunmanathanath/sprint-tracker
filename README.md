@@ -89,14 +89,35 @@ copy with the one-tap button.
   standing notepad meet in one place.
 - Persistent storage is requested right after onboarding (and can be re-requested in Settings).
 
+## Where the data lives, and backups
+
+Everything is in the browser's IndexedDB (database `sprint-tracker`, via Dexie) on the device — no
+server. Tables: `dailyLogs` (one record per day: every session's planned/actual minutes, tick, note,
+skip/trim/pause), `scratchCards`, `milestones`, `reviews`, `config`, `tracks`, plus `backups` and `kv`
+(below). Hours are never stored as such: every readout sums `actualMinutes` at read time. Planned
+minutes are snapshotted per day, so history is stable when the start date or load changes.
+
+Storage is per browser and per origin (localhost, github.io and the installed app on a phone are
+three separate stores), and it can be lost by clearing site data. Three layers guard against that:
+
+| Layer | When | Where it goes | Protects against |
+| --- | --- | --- | --- |
+| **Nightly snapshot** (Settings → Automatic backup, default **23:58**, keep 30) | at the set time while the app is open; otherwise on the next open / foreground as a catch-up | the `backups` table inside the app | bad edits, an accidental reset or import — one-tap **Restore** (a "before-restore" copy is kept, so even that is undoable) |
+| **Nightly folder file** (desktop Chrome/Edge) | same schedule | `sprint-tracker-YYYY-MM-DD.json` in a folder you pick once (put it in OneDrive/Drive/Dropbox for off-device safety) | losing the browser profile |
+| **Export / Share** (monthly reminder) | when you tap it | share sheet or download | losing the device |
+
+Only changed data creates a new snapshot, so quiet weeks don't pile up copies. A browser app cannot
+run while it is closed, which is why the schedule has the catch-up rule and why phones (no folder
+API) still need the occasional export.
+
 ## Project layout
 
 ```
 src/
   types.ts             data model
   seed/                tracks, phase 1/2 schedules, milestones, default config
-  db/                  Dexie schema, seed loader, export/import/reset
-  logic/               pure functions: day type, sprint week/phase, schedule, stats (+ tests)
+  db/                  Dexie schema, seed loader, export/import/reset, snapshots, folder backup
+  logic/               pure functions: day type, sprint week/phase, schedule, stats, backup schedule (+ tests)
   store/               Zustand store (write-through to IndexedDB), hooks (+ tests)
   screens/             Onboarding, Today, Progress, Scratch, Settings
   components/          TaskRow, Stopwatch, ReasonSheet, TrimSheet, LoadSheet, ConfirmMinutesSheet, DayStrip, TabBar, ui, icons

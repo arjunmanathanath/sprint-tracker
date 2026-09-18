@@ -221,6 +221,81 @@ describe("scratch cards", () => {
   });
 });
 
+describe("nightly snapshots", () => {
+  const at = (d: number, h: number, m: number) => new Date(2026, 8, d, h, m, 0).getTime();
+
+  it("takes a catch-up on first run, skips when nothing changed, and a nightly at the scheduled time", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(at(18, 9, 0));
+      const s = useStore.getState();
+      s.setCompleted(MON, "S1", true);
+      let r = await s.runNightlyBackup();
+      expect(r.ran).toBe(true);
+      expect(r.snapshot?.reason).toBe("catch-up");
+      expect(useStore.getState().snapshots).toHaveLength(1);
+
+      // Same day, later: not due.
+      vi.setSystemTime(at(18, 12, 0));
+      r = await s.runNightlyBackup();
+      expect(r.ran).toBe(false);
+
+      // 23:58 with unchanged data: runs, but stores nothing new.
+      vi.setSystemTime(at(18, 23, 58));
+      r = await s.runNightlyBackup();
+      expect(r.ran).toBe(true);
+      expect(r.snapshot).toBeNull();
+      expect(useStore.getState().snapshots).toHaveLength(1);
+
+      // Next night with a change: a "nightly" snapshot.
+      s.setActualMinutes("2026-09-19", "S2", 25);
+      vi.setSystemTime(at(19, 23, 59));
+      r = await s.runNightlyBackup();
+      expect(r.snapshot?.reason).toBe("nightly");
+      expect(useStore.getState().snapshots).toHaveLength(2);
+      expect(useStore.getState().snapshots[0].takenAt).toBe(at(19, 23, 59)); // newest first
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("respects the enabled flag and prunes to `keep`", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const s = useStore.getState();
+      s.setAutoBackup({ enabled: false });
+      vi.setSystemTime(at(18, 23, 59));
+      expect((await s.runNightlyBackup()).ran).toBe(false);
+      s.setAutoBackup({ enabled: true, keep: 2 });
+      for (let d = 18; d <= 21; d++) {
+        s.setActualMinutes(`2026-09-${d}`, "S1", d);
+        vi.setSystemTime(at(d, 23, 59));
+        await s.runNightlyBackup();
+      }
+      expect(useStore.getState().snapshots).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores a snapshot after keeping a before-restore copy, and reset keeps snapshots", async () => {
+    const s = useStore.getState();
+    s.setScratchNotes("T04", "first");
+    await s.runNightlyBackup(true);
+    const id = useStore.getState().snapshots[0].id;
+    s.setScratchNotes("T04", "second");
+    await s.restoreFromSnapshot(id);
+    expect(useStore.getState().scratch.T04.notes).toBe("first");
+    const reasons = useStore.getState().snapshots.map((m) => m.reason);
+    expect(reasons).toContain("before-restore");
+    await s.resetData();
+    expect(useStore.getState().config.startDate).toBeNull();
+    expect(useStore.getState().snapshots.length).toBeGreaterThanOrEqual(2);
+    const snap = await s.readSnapshot(id);
+    expect(snap?.json).toContain('"first"');
+  });
+});
+
 describe("export / import / reset", () => {
   it("round-trips all data", async () => {
     const s = useStore.getState();

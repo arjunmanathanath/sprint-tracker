@@ -43,6 +43,10 @@ export interface SprintConfig {
   loadFactor: number;
   loadFrom: string | null;
   loadUntil: string | null;
+  /** Nightly in-app snapshot (and folder file on desktop Chrome/Edge). */
+  autoBackup: { enabled: boolean; time: string; keep: number };
+  /** Last time the nightly job ran (whether or not anything changed). */
+  lastAutoBackupAt: number | null;
 }
 
 export interface Milestone {
@@ -102,6 +106,17 @@ export interface WeeklyReview {
   adjust: string;
   createdAt: number;
 }
+
+/** A stored copy of everything, taken by the nightly job or by hand. */
+export interface Snapshot {
+  id: string; // ISO datetime of the take
+  takenAt: number; // epoch ms
+  reason: "nightly" | "catch-up" | "manual" | "before-restore";
+  bytes: number;
+  json: string; // BackupFile as JSON text
+}
+
+export type SnapshotMeta = Omit<Snapshot, "json">;
 
 /** Shape of the JSON produced by Settings → Export. */
 export interface BackupFile {

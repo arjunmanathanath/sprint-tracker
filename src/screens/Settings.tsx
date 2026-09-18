@@ -7,7 +7,9 @@ import { dayOfWeek, formatLong, formatShort, minutesToHours, todayISO } from "..
 import { loadFactorOn } from "../logic/schedule";
 import { useStatsCtx } from "../store/hooks";
 import { LoadSheet } from "../components/LoadSheet";
-import { Button, Card, SectionTitle, Sheet } from "../components/ui";
+import { folderBackupSupported } from "../db/fsBackup";
+import type { SnapshotMeta } from "../types";
+import { Button, Card, Pill, SectionTitle, Sheet } from "../components/ui";
 
 export function Settings() {
   const config = useStore((s) => s.config);
@@ -25,6 +27,19 @@ export function Settings() {
   const loadFactor = loadFactorOn(todayISO(), ctx);
 
   const [pendingImport, setPendingImport] = useState<BackupFile | null>(null);
+  const [pendingRestore, setPendingRestore] = useState<SnapshotMeta | null>(null);
+  const [showAllSnapshots, setShowAllSnapshots] = useState(false);
+  const snapshots = useStore((s) => s.snapshots);
+  const backupDir = useStore((s) => s.backupDir);
+  const setAutoBackup = useStore((s) => s.setAutoBackup);
+  const runNightlyBackup = useStore((s) => s.runNightlyBackup);
+  const restoreFromSnapshot = useStore((s) => s.restoreFromSnapshot);
+  const deleteSnapshot = useStore((s) => s.deleteSnapshot);
+  const deleteAllSnapshots = useStore((s) => s.deleteAllSnapshots);
+  const readSnapshot = useStore((s) => s.readSnapshot);
+  const chooseBackupDir = useStore((s) => s.chooseBackupDir);
+  const reauthorizeBackupDir = useStore((s) => s.reauthorizeBackupDir);
+  const forgetBackupDir = useStore((s) => s.forgetBackupDir);
   const [confirmReset, setConfirmReset] = useState(false);
   const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,37 +70,95 @@ export function Settings() {
    * especially for home-screen PWAs on iOS where blob downloads may silently fail; elsewhere
    * download directly. `lastExportAt` is only marked once the file has actually gone somewhere.
    */
+  /** Hand a JSON text to the user via the share sheet or a download. Returns false if cancelled. */
+  const deliver = async (json: string, name: string, mode: "share" | "download"): Promise<boolean> => {
+    if (mode === "share") {
+      const file = new File([json], name, { type: "application/json" });
+      try {
+        await navigator.share({ files: [file], title: "Sprint Tracker backup" });
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return false; // user closed the share sheet
+        throw err;
+      }
+      return true;
+    }
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    return true;
+  };
+
   const doExport = async (mode: "share" | "download") => {
     setBusy(true);
     try {
       const backup = await exportData();
       const name = `sprint-tracker-${todayISO()}.json`;
-      const json = JSON.stringify(backup, null, 2);
       const summary = `${backup.dailyLogs.length} days, ${backup.scratchCards.length} scratch cards`;
-      if (mode === "share") {
-        const file = new File([json], name, { type: "application/json" });
-        try {
-          await navigator.share({ files: [file], title: "Sprint Tracker backup" });
-        } catch (err) {
-          if (err instanceof Error && err.name === "AbortError") return; // user closed the share sheet
-          throw err;
-        }
-        markExported();
-        setMessage({ tone: "ok", text: `Shared backup (${summary}).` });
-        return;
-      }
-      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      if (!(await deliver(JSON.stringify(backup, null, 2), name, mode))) return;
       markExported();
-      setMessage({ tone: "ok", text: `Downloaded ${name} (${summary}).` });
+      setMessage({ tone: "ok", text: `${mode === "share" ? "Shared" : "Downloaded"} ${name} (${summary}).` });
     } catch (err) {
       setMessage({ tone: "error", text: err instanceof Error ? err.message : "Export failed." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSnapshot = async (meta: SnapshotMeta) => {
+    setBusy(true);
+    try {
+      const snap = await readSnapshot(meta.id);
+      if (!snap) throw new Error("That snapshot no longer exists.");
+      const name = `sprint-tracker-${meta.id.slice(0, 10)}.json`;
+      if (await deliver(snap.json, name, canShareFiles ? "share" : "download")) {
+        markExported();
+        setMessage({ tone: "ok", text: `Saved snapshot ${name}.` });
+      }
+    } catch (err) {
+      setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not save the snapshot." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const snapshotNow = async () => {
+    setBusy(true);
+    try {
+      const r = await runNightlyBackup(true);
+      if (r.error) setMessage({ tone: "error", text: r.error });
+      else if (r.snapshot) setMessage({ tone: "ok", text: `Snapshot taken${r.fileWritten ? " and written to the backup folder" : ""}.` });
+      else setMessage({ tone: "ok", text: `Nothing changed since the last snapshot${r.fileWritten ? "; folder file refreshed" : ""}.` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doRestore = async () => {
+    if (!pendingRestore) return;
+    setBusy(true);
+    try {
+      await restoreFromSnapshot(pendingRestore.id);
+      setMessage({ tone: "ok", text: `Restored the snapshot from ${fmtWhen(pendingRestore.takenAt)}. A copy of the previous state was kept.` });
+      setPendingRestore(null);
+    } catch (err) {
+      setMessage({ tone: "error", text: err instanceof Error ? err.message : "Restore failed." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const withBusy = async (fn: () => Promise<void>, failText: string) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return;
+      setMessage({ tone: "error", text: err instanceof Error ? err.message : failText });
     } finally {
       setBusy(false);
     }
@@ -266,7 +339,154 @@ export function Settings() {
           onClose={() => setLoadOpen(false)}
         />
 
-        <SectionTitle>Backup</SectionTitle>
+        <SectionTitle>Automatic backup</SectionTitle>
+        <Card className="divide-y divide-border">
+          <label className="p-3.5 flex items-center justify-between gap-3 cursor-pointer">
+            <div className="min-w-0">
+              <span className="block text-sm">Nightly snapshot</span>
+              <span className="block text-xs text-muted">
+                A full copy is stored in this browser every night at the time below (or on the next open if the app was closed).
+                Only changed data is kept; the newest {config.autoBackup.keep} are retained.
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.autoBackup.enabled}
+              onChange={(e) => setAutoBackup({ enabled: e.target.checked })}
+              className="w-6 h-6 shrink-0 accent-[var(--color-accent)]"
+            />
+          </label>
+          <div className="p-3.5 flex items-center justify-between gap-3">
+            <label className="text-sm" htmlFor="cfg-backup-time">
+              Time
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                id="cfg-backup-time"
+                type="time"
+                value={config.autoBackup.time}
+                onChange={(e) => e.target.value && setAutoBackup({ time: e.target.value })}
+                className="rounded-xl bg-surface-2 border border-border px-3 py-2 text-sm tabular outline-none focus:border-accent"
+              />
+              <NumberField
+                id="cfg-backup-keep"
+                value={config.autoBackup.keep}
+                min={3}
+                max={365}
+                unit="kept"
+                onCommit={(n) => setAutoBackup({ keep: n })}
+              />
+            </div>
+          </div>
+          <div className="p-3.5">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-muted">
+                {config.lastAutoBackupAt ? `Last run ${fmtWhen(config.lastAutoBackupAt)}` : "Not run yet"} ·{" "}
+                {snapshots.length} snapshot{snapshots.length === 1 ? "" : "s"}
+                {snapshots.length > 0 && ` · ${(snapshots.reduce((sum, m) => sum + m.bytes, 0) / 1024).toFixed(0)} KB`}
+              </p>
+              <Button variant="secondary" className="min-h-9 px-3 text-xs shrink-0" onClick={() => void snapshotNow()} disabled={busy}>
+                Snapshot now
+              </Button>
+            </div>
+            {snapshots.length > 0 && (
+              <ul className="mt-3 space-y-1.5">
+                {(showAllSnapshots ? snapshots : snapshots.slice(0, 5)).map((m) => (
+                  <li key={m.id} className="flex items-center gap-2 text-xs">
+                    <span className="flex-1 min-w-0 truncate tabular">
+                      {fmtWhen(m.takenAt)}
+                      <span className="text-muted"> · {(m.bytes / 1024).toFixed(0)} KB</span>
+                    </span>
+                    <Pill tone={m.reason === "before-restore" ? "warn" : m.reason === "manual" ? "accent" : "muted"}>{m.reason}</Pill>
+                    <button type="button" onClick={() => setPendingRestore(m)} className="text-accent underline underline-offset-2" disabled={busy}>
+                      Restore
+                    </button>
+                    <button type="button" onClick={() => void saveSnapshot(m)} className="text-muted underline underline-offset-2" disabled={busy}>
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void withBusy(() => deleteSnapshot(m.id), "Could not delete.")}
+                      className="text-muted underline underline-offset-2"
+                      disabled={busy}
+                      aria-label="Delete snapshot"
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {snapshots.length > 5 && (
+              <button type="button" onClick={() => setShowAllSnapshots((v) => !v)} className="mt-2 text-[11px] text-muted underline underline-offset-2">
+                {showAllSnapshots ? "Show fewer" : `Show all ${snapshots.length}`}
+              </button>
+            )}
+          </div>
+          {folderBackupSupported() ? (
+            <div className="p-3.5">
+              <p className="text-sm">Also write a file to a folder</p>
+              <p className="text-xs text-muted">
+                Desktop Chrome/Edge only. Each run also writes <span className="tabular">sprint-tracker-YYYY-MM-DD.json</span> to a
+                folder you pick once, so a copy lives outside the browser (put it in a synced folder for off-device safety).
+              </p>
+              {backupDir ? (
+                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                  <span className="tabular">
+                    Folder: <span className="text-text">{backupDir.name}</span>
+                  </span>
+                  {backupDir.permission === "granted" ? (
+                    <Pill tone="ok">writable</Pill>
+                  ) : (
+                    <>
+                      <Pill tone="warn">needs permission</Pill>
+                      <button
+                        type="button"
+                        onClick={() => void withBusy(reauthorizeBackupDir, "Could not re-authorise the folder.")}
+                        className="text-accent underline underline-offset-2"
+                        disabled={busy}
+                      >
+                        Allow again
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void withBusy(chooseBackupDir, "Could not choose a folder.")}
+                    className="text-muted underline underline-offset-2"
+                    disabled={busy}
+                  >
+                    Change
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void withBusy(forgetBackupDir, "Could not forget the folder.")}
+                    className="text-muted underline underline-offset-2"
+                    disabled={busy}
+                  >
+                    Forget
+                  </button>
+                </div>
+              ) : (
+                <Button
+                  variant="secondary"
+                  className="mt-2 min-h-9 px-3 text-xs"
+                  onClick={() => void withBusy(chooseBackupDir, "Could not choose a folder.")}
+                  disabled={busy}
+                >
+                  Choose folder…
+                </Button>
+              )}
+            </div>
+          ) : (
+            <p className="p-3.5 text-xs text-muted">
+              This browser cannot write files on a schedule; snapshots stay inside the app. Use Export (below) now and then for an
+              off-device copy.
+            </p>
+          )}
+        </Card>
+
+        <SectionTitle>Export &amp; import</SectionTitle>
         <Card className="p-3.5">
           <p className="text-xs text-muted">
             Everything lives in this browser on this device. Export a JSON backup now and then; import it to restore or move phones.
@@ -320,10 +540,22 @@ export function Settings() {
 
         <SectionTitle>Danger zone</SectionTitle>
         <Card className="p-3.5">
-          <p className="text-xs text-muted">Deletes every log, note, question, review and setting on this device. Export first.</p>
-          <Button variant="danger" className="mt-3 w-full" onClick={() => setConfirmReset(true)} disabled={busy}>
-            Reset all data
-          </Button>
+          <p className="text-xs text-muted">
+            Deletes every log, note, question, review and setting on this device. Snapshots are kept (a copy is taken first), so
+            a reset can be undone from the list above.
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <Button variant="danger" onClick={() => setConfirmReset(true)} disabled={busy}>
+              Reset all data
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => void withBusy(deleteAllSnapshots, "Could not delete snapshots.")}
+              disabled={busy || snapshots.length === 0}
+            >
+              Delete snapshots
+            </Button>
+          </div>
         </Card>
 
         <p className="text-[11px] text-muted text-center mt-6">
@@ -352,6 +584,23 @@ export function Settings() {
         </div>
       </Sheet>
 
+      <Sheet open={pendingRestore !== null} onClose={() => setPendingRestore(null)} title="Restore this snapshot?">
+        {pendingRestore && (
+          <p className="text-sm text-muted">
+            Everything on this device will be replaced by the snapshot from {fmtWhen(pendingRestore.takenAt)} (
+            {pendingRestore.reason}). A copy of the current state is kept first, so this can be undone.
+          </p>
+        )}
+        <div className="mt-4 flex gap-2">
+          <Button variant="secondary" className="flex-1" onClick={() => setPendingRestore(null)}>
+            Cancel
+          </Button>
+          <Button variant="primary" className="flex-1" onClick={() => void doRestore()} disabled={busy}>
+            Restore
+          </Button>
+        </div>
+      </Sheet>
+
       <Sheet open={confirmReset} onClose={() => setConfirmReset(false)} title="Reset all data?">
         <p className="text-sm text-muted">This cannot be undone. {logCount} logged day{logCount === 1 ? "" : "s"} will be deleted.</p>
         <div className="mt-4 flex gap-2">
@@ -366,6 +615,9 @@ export function Settings() {
     </main>
   );
 }
+
+const fmtWhen = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
 /**
  * Number input that keeps a local draft while typing and only commits a valid value on

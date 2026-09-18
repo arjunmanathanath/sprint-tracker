@@ -1,4 +1,5 @@
 import type { SprintConfig } from "../types";
+import { DEFAULT_BACKUP_SCHEDULE } from "../logic/backupSchedule";
 
 // startDate stays null until the user picks it on first launch (default offered = next Sunday).
 export const DEFAULT_CONFIG: SprintConfig = {
@@ -11,6 +12,8 @@ export const DEFAULT_CONFIG: SprintConfig = {
   loadFactor: 1,
   loadFrom: null,
   loadUntil: null,
+  autoBackup: { ...DEFAULT_BACKUP_SCHEDULE },
+  lastAutoBackupAt: null,
 };
 
 /** A stopwatch running this long is probably forgotten: warn, and confirm the time on stop. */

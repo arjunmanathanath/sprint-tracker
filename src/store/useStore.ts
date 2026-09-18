@@ -1,7 +1,25 @@
 import { create } from "zustand";
 import { db } from "../db/dexie";
 import { ensureSeeded } from "../db/seedLoader";
-import { exportAll, importAll, resetAll, validateBackup } from "../db/backup";
+import {
+  exportAll,
+  getSnapshot,
+  importAll,
+  listSnapshots,
+  pruneSnapshots,
+  resetAll,
+  restoreSnapshot,
+  takeSnapshot,
+  validateBackup,
+} from "../db/backup";
+import {
+  backupDirPermission,
+  clearBackupDir,
+  loadBackupDir,
+  pickBackupDir,
+  writeBackupFile,
+} from "../db/fsBackup";
+import { isBackupDue, lastDueAt } from "../logic/backupSchedule";
 import { DEFAULT_CONFIG } from "../seed/config";
 import type {
   BackupFile,
@@ -9,6 +27,8 @@ import type {
   Milestone,
   OpenQuestion,
   ScratchCard,
+  Snapshot,
+  SnapshotMeta,
   SprintConfig,
   TaskEntry,
   Track,
@@ -39,6 +59,17 @@ interface State {
   scratch: Record<string, ScratchCard>;
   reviews: Record<ISODate, WeeklyReview>;
   runningTimer: RunningTimer | null;
+  /** Nightly/manual snapshots, newest first (metadata only; JSON stays in IndexedDB). */
+  snapshots: SnapshotMeta[];
+  /** Chosen backup folder (desktop Chrome/Edge) and whether we may write to it right now. */
+  backupDir: { name: string; permission: PermissionState } | null;
+}
+
+export interface BackupRunResult {
+  ran: boolean;
+  snapshot: SnapshotMeta | null;
+  fileWritten: boolean;
+  error: string | null;
 }
 
 interface Actions {
@@ -89,6 +120,19 @@ interface Actions {
   dismissError: () => void;
   importData: (raw: unknown) => Promise<void>;
   resetData: () => Promise<void>;
+
+  // Nightly backup
+  setAutoBackup: (patch: Partial<SprintConfig["autoBackup"]>) => void;
+  /** Take a snapshot (and write the folder file) if the schedule says one is due; `force` skips the check. */
+  runNightlyBackup: (force?: boolean) => Promise<BackupRunResult>;
+  restoreFromSnapshot: (id: string) => Promise<void>;
+  deleteSnapshot: (id: string) => Promise<void>;
+  deleteAllSnapshots: () => Promise<void>;
+  /** Returns the snapshot JSON text for saving/sharing. */
+  readSnapshot: (id: string) => Promise<Snapshot | undefined>;
+  chooseBackupDir: () => Promise<void>; // user gesture
+  reauthorizeBackupDir: () => Promise<void>; // user gesture
+  forgetBackupDir: () => Promise<void>;
 }
 
 export type Store = State & Actions;
@@ -122,6 +166,38 @@ function persist(p: Promise<unknown>, set: (s: Partial<State>) => void, get: () 
 }
 
 export const useStore = create<Store>()((set, get) => {
+  // The folder handle is not serialisable state; it lives here for the session.
+  let dirHandle: FileSystemDirectoryHandle | null = null;
+
+  async function refreshSnapshots() {
+    set({ snapshots: await listSnapshots(db) });
+  }
+
+  async function loadBackupState() {
+    await refreshSnapshots();
+    try {
+      dirHandle = await loadBackupDir(db);
+      if (dirHandle) set({ backupDir: { name: dirHandle.name, permission: await backupDirPermission(dirHandle) } });
+      else set({ backupDir: null });
+    } catch (err) {
+      console.warn("backup folder unavailable", err);
+      dirHandle = null;
+      set({ backupDir: null });
+    }
+  }
+
+  async function writeFolderFile(json: string, at: number): Promise<boolean> {
+    if (!dirHandle) return false;
+    const permission = await backupDirPermission(dirHandle);
+    set({ backupDir: { name: dirHandle.name, permission } });
+    if (permission !== "granted") return false;
+    const day = new Date(at);
+    const name = `sprint-tracker-${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}.json`;
+    await writeBackupFile(dirHandle, name, json);
+    get().setConfig({ lastExportAt: at });
+    return true;
+  }
+
   async function loadAll() {
     const [config, tracks, milestones, logs, cards, reviews] = await Promise.all([
       db.config.get("config"),
@@ -217,11 +293,14 @@ export const useStore = create<Store>()((set, get) => {
     scratch: {},
     reviews: {},
     runningTimer: null,
+    snapshots: [],
+    backupDir: null,
 
     init: async () => {
       try {
         await ensureSeeded(db);
         await loadAll();
+        await loadBackupState();
         set({ ready: true, error: null });
       } catch (err) {
         console.error(err);
@@ -396,9 +475,84 @@ export const useStore = create<Store>()((set, get) => {
     },
 
     resetData: async () => {
+      // Snapshots survive a reset on purpose: they are the way back from an accidental one.
+      await takeSnapshot(db, "before-restore");
       await resetAll(db);
       await loadAll();
+      await refreshSnapshots();
       set({ tab: "today", viewDate: todayISO() });
+    },
+
+    setAutoBackup: (patch) => {
+      get().setConfig({ autoBackup: { ...get().config.autoBackup, ...patch } });
+    },
+
+    runNightlyBackup: async (force = false) => {
+      const result: BackupRunResult = { ran: false, snapshot: null, fileWritten: false, error: null };
+      const now = Date.now();
+      const { autoBackup, lastAutoBackupAt } = get().config;
+      if (!force && (!autoBackup.enabled || !isBackupDue(new Date(now), lastAutoBackupAt, autoBackup.time))) return result;
+      result.ran = true;
+      try {
+        // "nightly" when we are within a few minutes of the scheduled moment, otherwise a catch-up.
+        const due = lastDueAt(new Date(now), autoBackup.time).getTime();
+        const reason: Snapshot["reason"] = force ? "manual" : now - due <= 5 * 60_000 ? "nightly" : "catch-up";
+        const snap = await takeSnapshot(db, reason, now);
+        await pruneSnapshots(db, autoBackup.keep);
+        if (snap) {
+          result.snapshot = { id: snap.id, takenAt: snap.takenAt, reason: snap.reason, bytes: snap.bytes };
+          result.fileWritten = await writeFolderFile(snap.json, now);
+        } else if (force && dirHandle) {
+          // Nothing changed, but a manual run should still refresh the folder file.
+          const latest = await db.backups.orderBy("takenAt").last();
+          if (latest) result.fileWritten = await writeFolderFile(latest.json, now);
+        }
+        get().setConfig({ lastAutoBackupAt: now });
+        await refreshSnapshots();
+      } catch (err) {
+        console.error("nightly backup failed", err);
+        result.error = err instanceof Error ? err.message : "Backup failed.";
+      }
+      return result;
+    },
+
+    restoreFromSnapshot: async (id) => {
+      await restoreSnapshot(db, id);
+      await loadAll();
+      await refreshSnapshots();
+    },
+
+    deleteSnapshot: async (id) => {
+      await db.backups.delete(id);
+      await refreshSnapshots();
+    },
+
+    deleteAllSnapshots: async () => {
+      await db.backups.clear();
+      await refreshSnapshots();
+    },
+
+    readSnapshot: (id) => getSnapshot(db, id),
+
+    chooseBackupDir: async () => {
+      dirHandle = await pickBackupDir(db);
+      set({ backupDir: { name: dirHandle.name, permission: "granted" } });
+      // Write today's file straight away so the folder is never empty after setup.
+      const latest = await db.backups.orderBy("takenAt").last();
+      const json = latest?.json ?? JSON.stringify(await exportAll(db));
+      await writeFolderFile(json, Date.now());
+    },
+
+    reauthorizeBackupDir: async () => {
+      if (!dirHandle) return;
+      const permission = await backupDirPermission(dirHandle, true);
+      set({ backupDir: { name: dirHandle.name, permission } });
+    },
+
+    forgetBackupDir: async () => {
+      dirHandle = null;
+      await clearBackupDir(db);
+      set({ backupDir: null });
     },
   };
 });

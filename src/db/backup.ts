@@ -1,5 +1,5 @@
 import type { SprintDB } from "./dexie";
-import type { BackupFile, SprintConfig } from "../types";
+import type { BackupFile, Snapshot, SnapshotMeta, SprintConfig } from "../types";
 import { DEFAULT_CONFIG } from "../seed/config";
 import { ensureSeeded, normalizeLog } from "./seedLoader";
 
@@ -80,4 +80,54 @@ export async function resetAll(db: SprintDB): Promise<void> {
     },
   );
   await ensureSeeded(db);
+}
+
+// ---------------------------------------------------------------- snapshots
+
+export const toMeta = (s: Snapshot): SnapshotMeta => ({ id: s.id, takenAt: s.takenAt, reason: s.reason, bytes: s.bytes });
+
+/**
+ * Store a full copy of the app data. Returns null (and stores nothing) when the data is
+ * identical to the newest snapshot, so a quiet week does not pile up copies.
+ */
+export async function takeSnapshot(db: SprintDB, reason: Snapshot["reason"], now = Date.now()): Promise<Snapshot | null> {
+  const backup = await exportAll(db);
+  const json = JSON.stringify({ ...backup, exportedAt: new Date(now).toISOString() });
+  const latest = await db.backups.orderBy("takenAt").last();
+  if (latest && reason !== "before-restore" && sameData(latest.json, json)) return null;
+  const snap: Snapshot = { id: new Date(now).toISOString(), takenAt: now, reason, bytes: json.length, json };
+  await db.backups.put(snap);
+  return snap;
+}
+
+/** Compare two backup JSON texts ignoring bookkeeping timestamps the backup job itself changes. */
+function sameData(a: string, b: string): boolean {
+  const strip = (j: string) => j.replace(/"(exportedAt|lastAutoBackupAt|lastExportAt)":("[^"]*"|\d+|null)/g, "");
+  return strip(a) === strip(b);
+}
+
+export async function listSnapshots(db: SprintDB): Promise<SnapshotMeta[]> {
+  const rows = await db.backups.orderBy("takenAt").reverse().toArray();
+  return rows.map(toMeta);
+}
+
+/** Delete the oldest snapshots beyond `keep`, never touching the newest one. */
+export async function pruneSnapshots(db: SprintDB, keep: number): Promise<number> {
+  const rows = await db.backups.orderBy("takenAt").reverse().toArray();
+  const extra = rows.slice(Math.max(1, keep));
+  if (extra.length) await db.backups.bulkDelete(extra.map((r) => r.id));
+  return extra.length;
+}
+
+export async function getSnapshot(db: SprintDB, id: string): Promise<Snapshot | undefined> {
+  return db.backups.get(id);
+}
+
+/** Replace the app data with a snapshot, keeping a "before-restore" copy of the current state first. */
+export async function restoreSnapshot(db: SprintDB, id: string): Promise<void> {
+  const snap = await db.backups.get(id);
+  if (!snap) throw new Error("That snapshot no longer exists.");
+  const backup = validateBackup(JSON.parse(snap.json));
+  await takeSnapshot(db, "before-restore");
+  await importAll(db, backup);
 }
