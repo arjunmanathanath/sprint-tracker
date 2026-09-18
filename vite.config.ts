@@ -4,7 +4,12 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { VitePWA } from "vite-plugin-pwa";
 
+// Sub-path hosting (GitHub Pages serves this repo at /sprint-tracker/). The Pages workflow sets
+// VITE_BASE; local dev and root-hosted builds keep "/".
+const base = process.env.VITE_BASE ?? "/";
+
 export default defineConfig({
+  base,
   define: {
     __APP_VERSION__: JSON.stringify(process.env.npm_package_version ?? "0.0.0"),
   },
@@ -22,8 +27,8 @@ export default defineConfig({
         background_color: "#0f1115",
         display: "standalone",
         orientation: "portrait",
-        start_url: "/",
-        scope: "/",
+        start_url: base,
+        scope: base,
         icons: [
           { src: "pwa-192.png", sizes: "192x192", type: "image/png" },
           { src: "pwa-512.png", sizes: "512x512", type: "image/png" },
@@ -32,7 +37,7 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,svg,png,ico,woff2}"],
-        navigateFallback: "index.html",
+        navigateFallback: `${base}index.html`,
       },
     }),
   ],

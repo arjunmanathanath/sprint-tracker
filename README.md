@@ -20,14 +20,16 @@ Node 20.12+ (Vite 6).
 
 ## Deploy & install on a phone
 
-1. `npm run build` and upload `dist/` to any static HTTPS host (Vercel, Netlify, Cloudflare Pages, GitHub Pages).
-   The service worker and manifest need HTTPS (or `localhost`).
-2. Open the URL on the phone → browser menu → **Add to Home Screen**. It launches full-screen.
-3. In **Settings**, tap **Keep persistent** so the browser will not evict the data under storage pressure,
+**Live:** https://arjunmanathanath.github.io/sprint-tracker/ — every push to `main` runs the tests,
+builds with `VITE_BASE=/sprint-tracker/` and deploys `dist/` via `.github/workflows/deploy.yml`.
+
+1. Open the URL on the phone → browser menu → **Add to Home Screen**. It launches full-screen.
+2. In **Settings**, tap **Keep persistent** so the browser will not evict the data under storage pressure,
    and export a JSON backup now and then (the app reminds you monthly).
 
-If you host under a sub-path (e.g. GitHub Pages `/repo/`), set `base` in `vite.config.ts` and the
-manifest `start_url`/`scope` to that path.
+Any other static HTTPS host works too: `npm run build` and upload `dist/`. For a sub-path host set
+`VITE_BASE=/that-path/` at build time (it drives Vite's `base`, the manifest `start_url`/`scope` and
+the service worker fallback); root hosts need nothing.
 
 ## How the app works
 
